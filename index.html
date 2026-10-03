@@ -162,6 +162,10 @@ body.no-cz .cz,body.no-cz .wordcz{visibility:hidden}
 .mic[data-state="listening"] .bub::before{animation:ring 1.4s ease-out infinite}
 .mic[data-state="listening"] .bub::after{animation:ring 1.4s ease-out .7s infinite}
 @keyframes ring{0%{transform:scale(1);opacity:.8}100%{transform:scale(1.9);opacity:0}}
+.mic[data-state="tap"] .bub{pointer-events:auto;cursor:pointer;width:120px;height:120px;animation:pulse 1.2s ease-in-out infinite}
+.mic[data-state="tap"] .bub::before{animation:ring 1.8s ease-out infinite}
+.mic .taphand{position:absolute;width:56px;right:-34px;bottom:-14px;pointer-events:none;animation:tap 1.2s ease-in-out infinite;display:none}
+.mic[data-state="tap"] .taphand{display:block}
 .mic[data-state="speaking"] .bub{background:var(--talk);color:#fff}
 .mic[data-state="ok"] .bub{background:var(--good);color:#fff;animation:pop .45s cubic-bezier(.3,1.6,.5,1)}
 .mic[data-state="miss"] .bub{background:var(--sun);color:#1E2A47;animation:shake .45s ease}
@@ -263,7 +267,7 @@ body.no-cz .cz,body.no-cz .wordcz{visibility:hidden}
 </div>
 
 <div class="mic" id="mic" hidden>
-  <div class="bub" id="micBub"></div>
+  <div class="bub" id="micBub" role="button" aria-label="Klepni a mluv"></div>
   <div class="tries" id="tries"><i></i><i></i><i></i></div>
   <small id="heard"></small>
 </div>
@@ -488,11 +492,16 @@ const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
 let micOn = !!Rec && store.get('mic', true);
 let rec = null, token = 0, micIntroDone = false;
 
+let micTries = 0;
+/* na dotykových zařízeních prohlížeč pustí mikrofon jen hned po klepnutí -> dítě klepne na mikrofon */
+const tapMode = () => matchMedia('(pointer: coarse)').matches;
+let tapStart = null, pendingFinish = null;
 function setMic(state, heard = '', tries = 0){
   const m = $('#mic');
+  micTries = tries;
   if (!state){ m.hidden = true; return; }
   m.hidden = false; m.dataset.state = state;
-  $('#micBub').innerHTML = state === 'listening' ? ICON_MIC : state === 'ok' ? ICON_OK : ICON_SPEAK;
+  $('#micBub').innerHTML = (state === 'listening' || state === 'tap') ? ICON_MIC + (state === 'tap' ? HAND.replace('class="tap"', 'class="taphand"') : '') : state === 'ok' ? ICON_OK : ICON_SPEAK;
   $('#heard').textContent = heard ? '„' + heard + '“' : '';
   [...$('#tries').children].forEach((d, i) => d.classList.toggle('used', i < tries));
 }
@@ -520,7 +529,8 @@ function listen(word){
     const r = new Rec();
     rec = r;
     r.lang = 'en-GB'; r.interimResults = true; r.maxAlternatives = 5; r.continuous = false;
-    const finish = v => { if (done) return; done = true; clearTimeout(to); try { r.abort(); } catch (e) {} if (rec === r) rec = null; resolve(v); };
+    let to = null;
+    const finish = v => { if (done) return; done = true; clearTimeout(to); tapStart = pendingFinish = null; try { r.abort(); } catch (e) {} if (rec === r) rec = null; resolve(v); };
     r.onresult = e => {
       for (let i = 0; i < e.results.length; i++){
         const res = e.results[i];
@@ -532,20 +542,27 @@ function listen(word){
     };
     r.onerror = e => finish({ok: false, heard, fatal: ['not-allowed', 'service-not-allowed', 'audio-capture', 'network'].includes(e.error), err: e.error});
     r.onend = () => finish({ok: false, heard: heard.trim()});
-    const to = setTimeout(() => finish({ok: false, heard: heard.trim()}), 7000);
-    try { r.start(); } catch (e) { finish({ok: false, fatal: true, err: 'start'}); }
+    const begin = () => {
+      setMic('listening', '', micTries); blip();
+      to = setTimeout(() => finish({ok: false, heard: heard.trim()}), 7000);
+      try { r.start(); } catch (e) { finish({ok: false, fatal: true, err: 'start'}); }
+    };
+    if (tapMode()){ pendingFinish = finish; tapStart = () => { tapStart = null; begin(); }; setMic('tap', '', micTries); }
+    else begin();
   });
 }
+$('#micBub').onclick = () => { if (tapStart) tapStart(); };
 function micBroken(err){
   micOn = false; updateToggles();
   note(err === 'not-allowed' || err === 'service-not-allowed'
-    ? 'Mikrofon není povolený. Povolte ho v prohlížeči (ikona zámku vedle adresy) a zapněte znovu „Mluvení“.'
+    ? 'Mikrofon není povolený. Povolte ho v nastavení prohlížeče pro tuto stránku (ikona zámku vedle adresy → Oprávnění → Mikrofon) a zapněte znovu „Mluvení“.'
     : err === 'network'
       ? 'Rozpoznávání řeči potřebuje internet. Mluvení je zatím vypnuté.'
       : 'Mikrofon se nepodařilo spustit. Mluvení je zatím vypnuté.');
 }
 function cancelAll(){
   token++;
+  if (pendingFinish) pendingFinish({ok: false});
   if (rec){ try { rec.abort(); } catch (e) {} rec = null; }
   if (canSpeak) speechSynthesis.cancel();
   clearHighlight(); setMic(null);
@@ -566,7 +583,7 @@ async function practice(word){
     await say(word);
     if (tk !== token) return null;
     await wait(150);
-    setMic('listening', '', attempt - 1); blip();
+    micTries = attempt - 1;
     const r = await listen(word);
     if (tk !== token) return null;
     if (r.fatal){ setMic(null); micBroken(r.err); return null; }
@@ -592,13 +609,13 @@ async function practice(word){
 let showCz = store.get('cz', true);
 function updateToggles(){
   $('#micBtn').setAttribute('aria-pressed', micOn);
-  $('#micBtn').disabled = !Rec;
-  if (!Rec) $('#micBtn').title = 'Tento prohlížeč neumí rozpoznávat řeč. Použijte Chrome nebo Edge.';
   $('#slowBtn').setAttribute('aria-pressed', slow);
   $('#czBtn').setAttribute('aria-pressed', showCz);
   document.body.classList.toggle('no-cz', !showCz);
 }
-$('#micBtn').onclick = () => { micOn = !micOn; store.set('mic', micOn); if (micOn) note(''); else cancelAll(); updateToggles(); };
+$('#micBtn').onclick = () => {
+  if (!Rec){ note('Tento prohlížeč neumí rozpoznávat řeč. Na Androidu použijte Chrome, na iPhonu/iPadu Safari, na počítači Chrome nebo Edge.'); return; }
+  micOn = !micOn; store.set('mic', micOn); if (micOn) note(''); else cancelAll(); updateToggles(); };
 $('#slowBtn').onclick = () => { slow = !slow; store.set('slow', slow); updateToggles(); };
 $('#czBtn').onclick = () => { showCz = !showCz; store.set('cz', showCz); updateToggles(); };
 updateToggles();
